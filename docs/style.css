@@ -120,3 +120,7 @@ select {
 input[type="number"] { width: auto; }
 input[type="checkbox"] { width: auto; accent-color: var(--accent); }
 h4.section-title { margin-bottom: 0.3rem; }
+.manual-odds { margin-top: 0.9rem; border-top: 1px solid var(--border); padding-top: 0.7rem; }
+.manual-odds summary { cursor: pointer; }
+.manual-odds-form { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-top: 0.6rem; }
+.manual-odds-form input { width: 7rem; }

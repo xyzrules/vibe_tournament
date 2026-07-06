@@ -342,14 +342,18 @@
     } else if (tab === 'knockout') {
       content = knockoutHtml(matches, rounds, now);
     } else if (tab === 'rankings') {
-      const { rankings } = await api('rankings', { league_id: Number(leagueId) });
-      content = rankings.length
+      const { rankings, max_points } = await api('rankings', { league_id: Number(leagueId) });
+      const maxLine = max_points != null
+        ? `<p class="muted small center">Highest obtainable score for this tournament: <b>${max_points}</b> points
+           (every match predicted correctly).</p>`
+        : '';
+      content = maxLine + (rankings.length
         ? `<table><tr><th>#</th><th>Player</th><th class="num">Points</th><th class="num">Correct</th><th class="num">Predicted</th></tr>
            ${rankings.map((r, i) => `
              <tr><td>${i + 1}</td><td>${esc(r.username)}${user && r.username === user.username ? ' <span class="badge pick">you</span>' : ''}</td>
-             <td class="num"><b>${r.points}</b></td><td class="num">${r.correct}</td><td class="num">${r.predicted}</td></tr>`).join('')}
+             <td class="num"><b>${r.points}</b> <span class="muted small">/ ${max_points}</span></td><td class="num">${r.correct}</td><td class="num">${r.predicted}</td></tr>`).join('')}
            </table>`
-        : '<p class="muted center">Nobody has scored points yet.</p>';
+        : '<p class="muted center">Nobody has scored points yet.</p>');
     } else if (tab === 'history') {
       const { history } = await api('history', { league_id: Number(leagueId) });
       content = history.length
@@ -370,14 +374,19 @@
 
   // ---- match view ------------------------------------------------------------
 
-  function oddsTable(odds) {
+  function hasManualOdds(odds) {
+    return !!odds && (odds.manual_home != null || odds.manual_draw != null || odds.manual_away != null);
+  }
+
+  function oddsTable(odds, withBookmakers) {
     const row = (label, h, d, a) =>
       `<tr><td>${label}</td><td class="num">${h ?? '—'}</td><td class="num">${d ?? '—'}</td><td class="num">${a ?? '—'}</td></tr>`;
     return `
       <table>
         <tr><th>Bookmaker</th><th class="num">1 (home)</th><th class="num">X (draw)</th><th class="num">2 (away)</th></tr>
-        ${row('DraftKings', odds.dk_home, odds.dk_draw, odds.dk_away)}
-        ${row('1xbet', odds.xb_home, odds.xb_draw, odds.xb_away)}
+        ${withBookmakers ? row('DraftKings', odds.dk_home, odds.dk_draw, odds.dk_away)
+          + row('1xbet', odds.xb_home, odds.xb_draw, odds.xb_away) : ''}
+        ${hasManualOdds(odds) ? row(`Manual · set by ${esc(odds.manual_by || 'admin')}`, odds.manual_home, odds.manual_draw, odds.manual_away) : ''}
       </table>`;
   }
 
@@ -441,6 +450,7 @@
           <div class="side">${m.away_logo ? `<img src="${esc(m.away_logo)}" alt="">` : ''}<b>${esc(m.away_team)}</b></div>
         </div>
         <p class="center muted">${finished ? extraScore(m) + ' ' : ''}${fmtDate(m.kickoff_unix)}${finished ? ' · full time' : m.locked ? ' · in play / awaiting result' : ''}</p>
+        ${user.is_admin && m.locked ? '<p class="center"><button id="admFetchResult">⟳ Fetch result now (admin)</button></p>' : ''}
         ${advNote}
         ${finished && m.my_pick ? `<p class="center">Your pick: <b>${esc(pickLabel(m, m.my_pick, m.my_hdp))}</b> ${outcomeBadge(m.my_outcome, m.my_points)}</p>` : ''}
         ${m.locked ? '' : pickButtonsHtml(m, mode)}
@@ -462,6 +472,24 @@
       };
     });
 
+    const fetchBtn = document.getElementById('admFetchResult');
+    if (fetchBtn) fetchBtn.onclick = async () => {
+      fetchBtn.disabled = true;
+      fetchBtn.textContent = '⟳ Fetching…';
+      try {
+        const r = await api('admin_sync', { league_id: Number(m.league_id), match_id: Number(matchId) });
+        const fresh = r.match;
+        toast(fresh && fresh.status === 'complete'
+          ? `Result: ${fresh.home_team} ${fresh.home_score}–${fresh.away_score} ${fresh.away_team}`
+          : 'Synced — no final result from the data provider yet.', true);
+        viewMatch(matchId);
+      } catch (err) {
+        toast(err.message);
+        fetchBtn.disabled = false;
+        fetchBtn.textContent = '⟳ Fetch result now (admin)';
+      }
+    };
+
     renderOdds(matchId, data.odds, data.odds_refresh_in, data.now);
   }
 
@@ -470,17 +498,34 @@
     if (!body) return;
     clearInterval(countdownTimer);
 
+    const manual = hasManualOdds(odds);
+    const fetched = !!odds && !Number(odds.no_match) && odds.fetched_at;
     const info = odds && odds.fetched_at
       ? `<p class="muted small">Updated ${agoMin(odds.fetched_at, serverNow)} min ago by ${esc(odds.fetched_by || '?')}.</p>`
       : '<p class="muted small">No odds fetched yet — be the first to press refresh.</p>';
-    const table = odds && !Number(odds.no_match) && odds.fetched_at ? oddsTable(odds) : '';
+    const table = fetched || manual ? oddsTable(odds, fetched) : '';
     const noMatch = odds && Number(odds.no_match)
-      ? '<p class="muted">No matching betting event was found for this match — odds unavailable.</p>'
+      ? `<p class="muted">No matching betting event was found for this match${manual ? ' — showing the odds set by the admin.' : ' — odds unavailable.'}</p>`
       : '';
+
+    const adminForm = user && user.is_admin ? `
+      <details class="manual-odds" ${!fetched && !manual ? 'open' : ''}>
+        <summary class="muted small">Set odds manually (admin)</summary>
+        <div class="manual-odds-form">
+          <input id="mnHome" type="number" step="0.01" min="1.01" placeholder="1 (home)" value="${odds?.manual_home ?? ''}"/>
+          <input id="mnDraw" type="number" step="0.01" min="1.01" placeholder="X (draw)" value="${odds?.manual_draw ?? ''}"/>
+          <input id="mnAway" type="number" step="0.01" min="1.01" placeholder="2 (away)" value="${odds?.manual_away ?? ''}"/>
+          <button id="mnSave" class="primary">Save</button>
+          ${manual ? '<button id="mnClear">Clear</button>' : ''}
+        </div>
+        <p class="muted small">Decimal odds (e.g. 2.10), shown to everyone. Leave draw empty for knockout matches;
+        use this when the odds service can't find the match. Refreshes never overwrite manual odds.</p>
+      </details>` : '';
 
     body.innerHTML = `${table}${noMatch}${info}
       <button id="oddsRefresh">Refresh odds</button>
-      <span class="muted small" id="oddsCountdown"></span>`;
+      <span class="muted small" id="oddsCountdown"></span>
+      ${adminForm}`;
 
     const btn = document.getElementById('oddsRefresh');
     const cd = document.getElementById('oddsCountdown');
@@ -517,19 +562,54 @@
         cd.textContent = '';
       }
     };
+
+    const saveManual = async (values) => {
+      try {
+        const r = await api('admin_odds', { match_id: Number(matchId), ...values });
+        toast(values.home == null && values.draw == null && values.away == null
+          ? 'Manual odds cleared.' : 'Manual odds saved.', true);
+        renderOdds(matchId, r.odds, r.odds_refresh_in, Math.floor(Date.now() / 1000));
+      } catch (err) { toast(err.message); }
+    };
+    const mnSave = document.getElementById('mnSave');
+    if (mnSave) mnSave.onclick = () => saveManual({
+      home: document.getElementById('mnHome').value || null,
+      draw: document.getElementById('mnDraw').value || null,
+      away: document.getElementById('mnAway').value || null,
+    });
+    const mnClear = document.getElementById('mnClear');
+    if (mnClear) mnClear.onclick = () => saveManual({ home: null, draw: null, away: null });
   }
 
   // ---- admin views -----------------------------------------------------------
+
+  function usageCardHtml(usage) {
+    const fd = (usage && usage.fd) || {};
+    const oa = (usage && usage.oa) || {};
+    const fdLine = fd.used != null
+      ? `<b>${fd.used}</b>${fd.limit != null ? ` / ${fd.limit}` : ''} requests used this month${fd.plan ? ` · ${esc(String(fd.plan))} plan` : ''}
+         <span class="muted small">(reported by the API, ${fd.checked_at ? `as of ${fmtDate(fd.checked_at)}` : 'time unknown'})</span>`
+      : `<span class="muted">no usage reported yet — press check below${fd.calls ? `; this script has made ${fd.calls} calls this month` : ''}</span>`;
+    const oaLine = `<b>${oa.calls || 0}</b> calls made by this script this month
+      <span class="muted small">(the provider has no usage endpoint; its limit is 5,000 requests/hour, so it's never the bottleneck)</span>`;
+    return `
+      <h3 style="margin-top:0">API usage</h3>
+      <p><b>footballdata.io</b> <span class="muted small">fixtures &amp; results — 1000 requests/month on the free plan</span><br>${fdLine}</p>
+      <p><b>odds-api.io</b> <span class="muted small">odds &amp; penalties</span><br>${oaLine}</p>
+      <button id="usageCheck">⟳ Check usage now</button>
+      <span class="muted small">asks footballdata.io for the current numbers</span>`;
+  }
 
   async function viewAdmin() {
     if (requireLogin()) return;
     if (!user.is_admin) { location.hash = '#/'; return; }
     busy('Loading admin…');
-    const { tournaments } = await api('admin_overview');
+    const { tournaments, usage } = await api('admin_overview');
     app.innerHTML = `
       <h2>⚙ Admin</h2>
       <p class="muted small">Changes apply immediately for everyone. Hidden tournaments/matches disappear
       from players' views but keep their data.</p>
+      <div class="card" id="usageCard">${usageCardHtml(usage)}</div>
       ${tournaments.map((t) => `
         <div class="card" data-league="${t.league_id}">
           <h3 style="margin-top:0">${esc(t.name)} <span class="muted small">${esc(t.season_year || '')} · ${t.match_count} matches</span></h3>
@@ -554,11 +634,49 @@
                 value="${(t.round_points || {})[String(r.round_id)] ?? ''}" placeholder="${t.default_points}" style="width:5rem"/></td></tr>`).join('')}
             </table>
             <p class="muted small">Empty = use the default points.</p>` : ''}
-          <div style="display:flex; gap:0.6rem; margin-top:0.7rem">
+          <div style="display:flex; gap:0.6rem; margin-top:0.7rem; align-items:center; flex-wrap:wrap">
             <button class="primary adm-save">Save</button>
             <a class="btn" href="#/admin/t/${t.league_id}">Manage matches →</a>
+            <button class="adm-sync">⟳ Sync fixtures &amp; results now</button>
+            <span class="muted small">${t.last_synced ? `last synced ${fmtDate(t.last_synced)}` : 'never synced'}</span>
           </div>
         </div>`).join('')}`;
+
+    const bindUsageCheck = () => {
+      const btn = document.getElementById('usageCheck');
+      if (!btn) return;
+      btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = '⟳ Checking…';
+        try {
+          const r = await api('admin_usage');
+          document.getElementById('usageCard').innerHTML = usageCardHtml(r.usage);
+          bindUsageCheck();
+        } catch (err) {
+          toast(err.message);
+          btn.disabled = false;
+          btn.textContent = '⟳ Check usage now';
+        }
+      };
+    };
+    bindUsageCheck();
+
+    app.querySelectorAll('.adm-sync').forEach((btn) => {
+      btn.onclick = async () => {
+        const card = btn.closest('[data-league]');
+        btn.disabled = true;
+        btn.textContent = '⟳ Syncing…';
+        try {
+          await api('admin_sync', { league_id: Number(card.dataset.league) });
+          toast('Fixtures & results synced.', true);
+          viewAdmin();
+        } catch (err) {
+          toast(err.message);
+          btn.disabled = false;
+          btn.textContent = '⟳ Sync fixtures & results now';
+        }
+      };
+    });
 
     app.querySelectorAll('.adm-save').forEach((btn) => {
       btn.onclick = async () => {
@@ -592,9 +710,11 @@
       <p><a class="muted" href="#/admin">← back to admin</a></p>
       <h2>${esc(tournament.name)} — matches</h2>
       <p class="muted small">Untick "show" to hide a match from players.${isHandicap ? ' Set the handicap line (e.g. -0.5 means the home team gives half a goal); players can only pick once a line is set.' : ''}</p>
+      <p><button id="admSyncNow">⟳ Sync fixtures &amp; results now</button>
+        <span class="muted small">${tournament.last_synced ? `last synced ${fmtDate(tournament.last_synced)}` : 'never synced'}</span></p>
       <div class="card" style="padding:0.4rem 0.8rem">
         <table>
-          <tr><th>show</th><th>Match</th><th>Kickoff</th><th>Status</th>${isHandicap ? '<th>Line (home)</th>' : ''}</tr>
+          <tr><th>show</th><th>Match</th><th>Kickoff</th><th>Status</th>${isHandicap ? '<th>Line (home)</th>' : ''}<th></th></tr>
           ${matches.map((m) => `
             <tr data-match="${m.match_id}">
               <td><input type="checkbox" class="adm-show" ${Number(m.hidden) ? '' : 'checked'}/></td>
@@ -603,6 +723,8 @@
               <td class="muted small">${fmtDate(m.kickoff_unix)}</td>
               <td class="muted small">${esc(m.round_name || '')}${now >= m.kickoff_unix ? ' · locked' : ''}</td>
               ${isHandicap ? `<td><input type="number" class="adm-hdp" step="0.25" value="${m.hdp ?? ''}" placeholder="—" style="width:5rem"/></td>` : ''}
+              <td>${m.status !== 'complete' && now >= m.kickoff_unix
+                ? '<button class="adm-fetch" title="Fetch this match’s result now">⟳ result</button>' : ''}</td>
             </tr>`).join('')}
         </table>
       </div>`;
@@ -618,6 +740,32 @@
     });
     app.querySelectorAll('.adm-hdp').forEach((inp) => {
       inp.onchange = () => save(inp.closest('tr'), { hdp: inp.value === '' ? null : Number(inp.value) });
+    });
+
+    const syncTournament = async (btn, match_id) => {
+      btn.disabled = true;
+      try {
+        const r = await api('admin_sync', {
+          league_id: Number(leagueId),
+          ...(match_id != null ? { match_id } : {}),
+        });
+        const fresh = r.match;
+        if (match_id != null) {
+          toast(fresh && fresh.status === 'complete'
+            ? `Result: ${fresh.home_team} ${fresh.home_score}–${fresh.away_score} ${fresh.away_team}`
+            : 'Synced — no final result from the data provider yet.', true);
+        } else {
+          toast('Fixtures & results synced.', true);
+        }
+        viewAdminMatches(leagueId);
+      } catch (err) {
+        toast(err.message);
+        btn.disabled = false;
+      }
+    };
+    document.getElementById('admSyncNow').onclick = (e) => syncTournament(e.target);
+    app.querySelectorAll('.adm-fetch').forEach((btn) => {
+      btn.onclick = () => syncTournament(btn, Number(btn.closest('tr').dataset.match));
     });
   }
 

@@ -1,66 +1,10 @@
-# ⚽ Kèo máu
+# ⚽ Kèo máu — Setup
 
-Predict soccer match results with your friends. Pick a tournament, browse the
-fixtures, call who wins before kickoff, then watch the rankings as real
-results come in.
-
-- **Tournaments:** Premier League, La Liga, Champions League, Europa League,
-  World Cup (the leagues included in the footballdata.io free plan).
-- **Real data:** fixtures & results from [footballdata.io](https://footballdata.io),
-  match-winner odds from [odds-api.io](https://odds-api.io) (DraftKings + 1xbet).
-- **Free hosting:** the website runs on GitHub Pages; the database is a
-  **private Google Sheet** of yours, driven by a free Google Apps Script that
-  acts as the server (it also hides the API keys and runs the daily sync).
-
-## How the game works
-
-- Everyone signs up with a username + password (casual accounts — the signup
-  page warns people not to reuse a real password; only salted hashes are
-  stored, never plaintext).
-- Predictions are changeable until kickoff, locked at kickoff. A correct pick
-  earns that match's points (set by the admin; can differ per round).
-- Three guess modes, set per tournament by the admin:
-  - **Win / Draw / Loss** — classic 1X2 on the regulation result.
-  - **Win / Loss** — pick who advances; penalties and extra time count
-    (shootout scores come from the odds service and are shown as
-    `1–1 (pens 4–2)`).
-  - **Goal handicap** — the admin sets a line per match (e.g. `-0.5`); you
-    pick a side against the line you saw, landing exactly on the line is a
-    push (0 points).
-- Other players' picks stay hidden until kickoff, then everyone can see who
-  picked what on the match page.
-- Per-tournament tabs: **Fixtures** and **Results** grouped by round /
-  matchday, **Table** (league table, or group tables computed from group
-  results), **Knockout** (rounds in order — see who advances to face whom),
-  **Rankings**, **History**.
-- **Odds:** never auto-fetched. Any user can press *Refresh odds* on a match;
-  the result is stored and shared with everyone, and further refreshes are
-  locked for 5 minutes (the page shows who refreshed and when). If the odds
-  service has no confidently-matching event, the match shows "odds
-  unavailable" rather than wrong odds.
-- **Fixture syncing** is stingy with the API budget (1000 requests/month on
-  the free plan): one full sync per day, plus a single re-fetch ~3 hours
-  after a match should have finished to pick up the result.
-
-## Admin
-
-A user `admin` (password `admin`) is created automatically — log in with it
-to get the ⚙ Admin page:
-
-- show/hide whole tournaments or individual matches,
-- set the guess mode per tournament,
-- set default points per match and different points per round (e.g. World
-  Cup group games 1 pt, quarter-finals 3 pts),
-- set the handicap line per match (players can't pick until a line is set).
-
-Changing the guess mode never re-scores old picks — each pick is scored
-under the mode that was active when it was made. Change the admin password
-by deleting the admin row in the sheet's `Users` tab and signing up `admin`
-again with a better password (do that before sharing the link).
+How to get the site running. You need: a Google account, a GitHub account,
+and API keys for [footballdata.io](https://footballdata.io) (fixtures &
+results) and [odds-api.io](https://odds-api.io) (match odds).
 
 ## Setup — GitHub Pages + Google Sheet (recommended, free)
-
-You need: a Google account, a GitHub account, and your two API keys.
 
 ### 1. Create the Google Sheet backend
 
@@ -100,6 +44,13 @@ You need: a Google account, a GitHub account, and your two API keys.
    `https://<your-username>.github.io/<repo-name>/` — share that link with
    your friends.
 
+### 3. Secure the admin account
+
+A user `admin` (password `admin`) is created automatically and gets the
+⚙ Admin page on the site. **Before sharing the link**, change the password:
+delete the admin row in the sheet's `Users` tab and sign up `admin` again
+with a better password.
+
 ### Notes on this setup
 
 - The Apps Script URL is public but useless without playing by the rules —
@@ -108,8 +59,9 @@ You need: a Google account, a GitHub account, and your two API keys.
 - Anyone who signs up can play. If someone misbehaves, delete their row in
   the sheet's `Users` tab.
 - Responses take ~1–2 seconds (that's Apps Script); fine for a friend group.
-- To update the backend later: paste the new `Code.gs`, then
-  **Deploy → Manage deployments → edit → New version**. The URL stays the same.
+- To update the backend later: paste the new `Code.gs`, run `setup` once
+  (adds any new columns), then **Deploy → Manage deployments → edit →
+  New version**. The URL stays the same.
 - Your sheet **is** the database — you can watch predictions arrive live,
   and Google keeps version history (File → Version history) as backup.
 
@@ -138,15 +90,3 @@ Open <http://localhost:3000>. Tests: `npm test`.
 
 Use this for local development, or deploy it to any Node host with a
 persistent disk (Railway, Fly.io, Render, a Raspberry Pi).
-
-## Project layout
-
-```text
-apps-script/Code.gs   Google Apps Script backend (Sheet = database)
-docs/                 static website for GitHub Pages (points at Apps Script)
-docs/config.js        ← paste your Web app URL here
-server.js + src/      standalone Node implementation (optional alternative)
-public/               frontend for the Node implementation
-tests/                node --test suite for the Node implementation
-docs/superpowers/     design spec + implementation plan
-```

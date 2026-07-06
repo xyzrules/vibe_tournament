@@ -22,8 +22,10 @@
  * ADMIN: a user `admin` (password `admin`) is created automatically and
  * gets the Admin page on the site: show/hide tournaments and matches, set
  * the guess mode per tournament (1x2 / win-loss / handicap), points per
- * match and per round. CHANGE THE ADMIN PASSWORD after first login by
- * editing the Users tab (or just keep the sheet private and trust friends).
+ * match and per round, force an immediate fixtures/results sync, and set
+ * match odds manually when the odds service can't find the event.
+ * CHANGE THE ADMIN PASSWORD after first login by editing the Users tab
+ * (or just keep the sheet private and trust friends).
  */
 
 // ---------------------------------------------------------------------------
@@ -50,7 +52,8 @@ var TABS = {
             'round_id', 'pen_home', 'pen_away', 'adv_winner', 'aet', 'hidden', 'hdp'],
   Predictions: ['username', 'match_id', 'pick', 'updated_at', 'hdp', 'mode'],
   Odds: ['match_id', 'event_id', 'fetched_at', 'fetched_by', 'no_match',
-         'dk_home', 'dk_draw', 'dk_away', 'xb_home', 'xb_draw', 'xb_away'],
+         'dk_home', 'dk_draw', 'dk_away', 'xb_home', 'xb_draw', 'xb_away',
+         'manual_home', 'manual_draw', 'manual_away', 'manual_by', 'manual_at'],
   Meta: ['key', 'value'],
 };
 
@@ -170,7 +173,8 @@ function doPost(e) {
     history: apiHistory_, match: apiMatchDetail_, predict: apiPredict_,
     odds_refresh: apiOddsRefresh_,
     admin_overview: apiAdminOverview_, admin_tournament: apiAdminTournament_,
-    admin_match: apiAdminMatch_,
+    admin_match: apiAdminMatch_, admin_sync: apiAdminSync_, admin_odds: apiAdminOdds_,
+    admin_usage: apiAdminUsage_,
   };
   var handler = actions[body.action];
   if (!handler) return json_({ error: 'unknown action', code: 404 });
@@ -183,7 +187,7 @@ function doPost(e) {
       : /locked/.test(msg) ? 403
       : /not found/.test(msg) ? 404
       : /taken/.test(msg) ? 409
-      : /username|password|pick|JSON|line|mode|points/.test(msg) ? 400 : 500;
+      : /username|password|pick|JSON|line|mode|points|odds/.test(msg) ? 400 : 500;
     return json_({ error: msg, code: code });
   }
 }
@@ -578,7 +582,10 @@ function apiRankings_(body) {
   list.sort(function (a, b) {
     return b.points - a.points || acc(b) - acc(a) || a.username.localeCompare(b.username);
   });
-  return { rankings: list };
+  // highest score obtainable: every visible match predicted correctly
+  var max_points = 0;
+  Object.keys(byId).forEach(function (k) { max_points += byId[k].points; });
+  return { rankings: list, max_points: max_points };
 }
 
 function apiHistory_(body) {
@@ -630,7 +637,20 @@ function apiAdminOverview_(body) {
     return out;
   });
   ts.sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
-  return { tournaments: ts };
+  return { tournaments: ts, usage: usageInfo_() };
+}
+
+// Live API-budget check: /account/usage is footballdata.io's dedicated (free)
+// usage endpoint; if it's ever unavailable, fall back to the cheapest real
+// call — every response carries the same usage meta.
+function apiAdminUsage_(body) {
+  requireAdmin_(body);
+  try {
+    fdGet_('/account/usage');
+  } catch (err) {
+    fdGet_('/leagues');
+  }
+  return { ok: true, usage: usageInfo_() };
 }
 
 function apiAdminTournament_(body) {
@@ -678,6 +698,75 @@ function apiAdminMatch_(body) {
   return { ok: true };
 }
 
+// Admin "sync now": re-fetch the tournament's fixtures & results immediately
+// instead of waiting for the hourly tick. With a match_id it also runs the
+// penalties/advancing-team lookup for that match when it applies.
+function apiAdminSync_(body) {
+  requireAdmin_(body);
+  var t = getTournament_(body.league_id);
+  if (!t || t.season_id == null) throw new Error('not found');
+  var now = now_();
+  syncSeasonMatches_(Number(t.league_id), t.season_id);
+  t.last_synced = now;
+  updateRow_('Tournaments', t._row, t);
+
+  var match = null;
+  if (body.match_id != null) {
+    var all = leagueMatches_(t.league_id);
+    var roundMap = roundsByIdMap_(roundsInfo_(all));
+    var m = all.filter(function (r) { return Number(r.match_id) === Number(body.match_id); })[0];
+    if (!m) throw new Error('not found');
+    if (needsEnrich_(m, roundMap)) {
+      try {
+        enrichMatch_(m);
+      } catch (err) {
+        console.error('pen enrichment failed for match ' + m.match_id + ': ' + err);
+      }
+    }
+    decorateMatch_(m, t, roundMap);
+    delete m._row;
+    match = m;
+  }
+  return { ok: true, last_synced: now, match: match };
+}
+
+// Admin manual odds: fallback for when the odds service has no matching
+// event (footballdata ↔ odds-api naming differences). Stored next to the
+// fetched odds and preserved across refreshes; sending all-empty clears them.
+function apiAdminOdds_(body) {
+  var username = requireAdmin_(body);
+  var matchId = Number(body.match_id);
+  var m = readTab_('Matches').filter(function (r) { return Number(r.match_id) === matchId; })[0];
+  if (!m) throw new Error('not found');
+  var vals = {};
+  ['home', 'draw', 'away'].forEach(function (k) {
+    var v = body[k];
+    if (v == null || v === '') { vals[k] = null; return; }
+    var n = Number(v);
+    if (!isFinite(n) || n <= 1) throw new Error('bad odds: use decimal odds greater than 1 (e.g. 2.10)');
+    vals[k] = n;
+  });
+  var clearing = vals.home == null && vals.draw == null && vals.away == null;
+  var lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    var existing = readTab_('Odds').filter(function (r) { return Number(r.match_id) === matchId; })[0];
+    var row = existing || { match_id: matchId };
+    row.manual_home = vals.home;
+    row.manual_draw = vals.draw;
+    row.manual_away = vals.away;
+    row.manual_by = clearing ? null : username;
+    row.manual_at = clearing ? null : now_();
+    if (existing) updateRow_('Odds', existing._row, row);
+    else appendRow_('Odds', row);
+  } finally {
+    lock.releaseLock();
+  }
+  var now = now_();
+  var odds = getOddsRow_(matchId);
+  return { ok: true, odds: odds, odds_refresh_in: oddsRefreshIn_(odds, now) };
+}
+
 // ---------------------------------------------------------------------------
 // Odds with the shared 5-minute lock
 // ---------------------------------------------------------------------------
@@ -710,7 +799,15 @@ function apiOddsRefresh_(body) {
       return { status: 'locked', odds: existing, odds_refresh_in: oddsRefreshIn_(existing, now) };
     }
 
+    // Admin-entered manual odds live in the same row — never clobbered by a refresh.
+    var manual = {};
+    if (existing) {
+      ['manual_home', 'manual_draw', 'manual_away', 'manual_by', 'manual_at'].forEach(function (f) {
+        manual[f] = existing[f];
+      });
+    }
     var saveRow = function (obj) {
+      Object.keys(manual).forEach(function (f) { obj[f] = manual[f]; });
       if (existingRow) updateRow_('Odds', existingRow._row, obj);
       else appendRow_('Odds', obj);
     };
@@ -815,13 +912,50 @@ function prop_(key) {
   return v;
 }
 
+// --- API usage tracking (shown on the Admin page) --------------------------
+// footballdata.io reports plan/requests_used/requests_limit in the `meta` of
+// every response — we store the latest snapshot. odds-api.io has no usage
+// endpoint, so for it (and as a fallback) we count this script's own calls,
+// reset each calendar month.
+
+function ym_() {
+  var d = new Date();
+  return d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2);
+}
+
+function readUsage_(key) {
+  try { return JSON.parse(metaGet_(key) || 'null') || {}; } catch (e) { return {}; }
+}
+
+function bumpUsage_(key, apiMeta) {
+  var u = readUsage_(key);
+  var month = ym_();
+  if (u.month !== month) { u.month = month; u.calls = 0; }
+  u.calls = (u.calls || 0) + 1;
+  if (apiMeta && apiMeta.requests_used != null) {
+    u.plan = apiMeta.plan || u.plan || null;
+    u.used = Number(apiMeta.requests_used);
+    u.limit = apiMeta.requests_limit != null ? Number(apiMeta.requests_limit) : (u.limit != null ? u.limit : null);
+    u.checked_at = now_();
+  }
+  metaSet_(key, JSON.stringify(u));
+}
+
+function usageInfo_() {
+  return { fd: readUsage_('fd_usage'), oa: readUsage_('oa_usage'), month: ym_() };
+}
+
 function fdGet_(pathname) {
   var res = UrlFetchApp.fetch(FD_BASE + pathname, {
     headers: { Authorization: 'Bearer ' + prop_('FOOTBALLDATA_API_KEY') },
     muteHttpExceptions: true,
   });
-  if (res.getResponseCode() !== 200) throw new Error('footballdata.io HTTP ' + res.getResponseCode());
+  if (res.getResponseCode() !== 200) {
+    bumpUsage_('fd_usage', null);
+    throw new Error('footballdata.io HTTP ' + res.getResponseCode());
+  }
   var body = JSON.parse(res.getContentText());
+  bumpUsage_('fd_usage', body && body.meta);
   if (body && body.success === false) throw new Error('footballdata.io error: ' + (body.message || 'unknown'));
   return body;
 }
@@ -833,6 +967,7 @@ function oaGet_(pathname, params) {
   var res = UrlFetchApp.fetch(OA_BASE + pathname + '?' + qs + '&apiKey=' + encodeURIComponent(prop_('ODDS_API_KEY')), {
     muteHttpExceptions: true,
   });
+  bumpUsage_('oa_usage', null);
   if (res.getResponseCode() !== 200) throw new Error('odds-api.io HTTP ' + res.getResponseCode());
   return JSON.parse(res.getContentText());
 }
@@ -974,6 +1109,39 @@ function syncAll_(now) {
 // the event up once and store who actually advanced.
 // ---------------------------------------------------------------------------
 
+// True for knockout matches that finished level in regulation and haven't
+// had their advancing-team lookup yet (adv_winner is home/away/none once done).
+function needsEnrich_(m, roundMap) {
+  var r = roundMap[String(m.round_id)];
+  if (!r || r.is_group) return false;
+  if (m.status !== 'complete' || m.home_score == null) return false;
+  if (Number(m.home_score) !== Number(m.away_score)) return false; // decided in regulation
+  return !m.adv_winner;
+}
+
+// One odds-api lookup: stores who advanced + penalties / AET on the match row.
+function enrichMatch_(m) {
+  var events = oaSearchEvents_(m.home_team);
+  var ev = findEvent_(m, events);
+  var update = { adv_winner: 'none', aet: 0, pen_home: null, pen_away: null };
+  if (ev && ev.scores) {
+    var sc = ev.scores;
+    if (Number(sc.home) > Number(sc.away)) update.adv_winner = 'home';
+    else if (Number(sc.home) < Number(sc.away)) update.adv_winner = 'away';
+    var periods = sc.periods || {};
+    if (periods.ap) {
+      update.pen_home = Number(periods.ap.home);
+      update.pen_away = Number(periods.ap.away);
+    }
+    if (periods.ot) update.aet = 1;
+  }
+  m.adv_winner = update.adv_winner;
+  m.aet = update.aet;
+  m.pen_home = update.pen_home;
+  m.pen_away = update.pen_away;
+  updateRow_('Matches', m._row, m);
+}
+
 function enrichKnockouts_() {
   var tournaments = readTab_('Tournaments').filter(function (t) {
     return t.visible == null || Number(t.visible) === 1;
@@ -985,34 +1153,10 @@ function enrichKnockouts_() {
     var roundMap = roundsByIdMap_(roundsInfo_(all));
     all.forEach(function (m) {
       if (budget <= 0) return;
-      var r = roundMap[String(m.round_id)];
-      var isKnockout = r && !r.is_group;
-      if (!isKnockout) return;
-      if (m.status !== 'complete' || m.home_score == null) return;
-      if (Number(m.home_score) !== Number(m.away_score)) return; // decided in regulation
-      if (m.adv_winner) return; // already enriched (home/away/none)
+      if (!needsEnrich_(m, roundMap)) return;
       budget -= 1;
       try {
-        var events = oaSearchEvents_(m.home_team);
-        var ev = findEvent_(m, events);
-        var update = { adv_winner: 'none', aet: 0, pen_home: null, pen_away: null };
-        if (ev && ev.scores) {
-          var sc = ev.scores;
-          if (Number(sc.home) > Number(sc.away)) update.adv_winner = 'home';
-          else if (Number(sc.home) < Number(sc.away)) update.adv_winner = 'away';
-          var periods = sc.periods || {};
-          if (periods.ap) {
-            update.pen_home = Number(periods.ap.home);
-            update.pen_away = Number(periods.ap.away);
-          }
-          if (periods.ot) update.aet = 1;
-        }
-        MATCH_KEEP_FIELDS.forEach(function () {}); // (fields preserved by sync)
-        m.adv_winner = update.adv_winner;
-        m.aet = update.aet;
-        m.pen_home = update.pen_home;
-        m.pen_away = update.pen_away;
-        updateRow_('Matches', m._row, m);
+        enrichMatch_(m);
       } catch (err) {
         console.error('pen enrichment failed for match ' + m.match_id + ': ' + err);
       }
