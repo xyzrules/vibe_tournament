@@ -374,19 +374,14 @@
 
   // ---- match view ------------------------------------------------------------
 
-  function hasManualOdds(odds) {
-    return !!odds && (odds.manual_home != null || odds.manual_draw != null || odds.manual_away != null);
-  }
-
-  function oddsTable(odds, withBookmakers) {
+  function oddsTable(odds) {
     const row = (label, h, d, a) =>
       `<tr><td>${label}</td><td class="num">${h ?? '—'}</td><td class="num">${d ?? '—'}</td><td class="num">${a ?? '—'}</td></tr>`;
     return `
       <table>
         <tr><th>Bookmaker</th><th class="num">1 (home)</th><th class="num">X (draw)</th><th class="num">2 (away)</th></tr>
-        ${withBookmakers ? row('DraftKings', odds.dk_home, odds.dk_draw, odds.dk_away)
-          + row('1xbet', odds.xb_home, odds.xb_draw, odds.xb_away) : ''}
-        ${hasManualOdds(odds) ? row(`Manual · set by ${esc(odds.manual_by || 'admin')}`, odds.manual_home, odds.manual_draw, odds.manual_away) : ''}
+        ${row('DraftKings', odds.dk_home, odds.dk_draw, odds.dk_away)}
+        ${row('1xbet', odds.xb_home, odds.xb_draw, odds.xb_away)}
       </table>`;
   }
 
@@ -498,34 +493,29 @@
     if (!body) return;
     clearInterval(countdownTimer);
 
-    const manual = hasManualOdds(odds);
     const fetched = !!odds && !Number(odds.no_match) && odds.fetched_at;
     const info = odds && odds.fetched_at
       ? `<p class="muted small">Updated ${agoMin(odds.fetched_at, serverNow)} min ago by ${esc(odds.fetched_by || '?')}.</p>`
       : '<p class="muted small">No odds fetched yet — be the first to press refresh.</p>';
-    const table = fetched || manual ? oddsTable(odds, fetched) : '';
+    const table = fetched ? oddsTable(odds) : '';
     const noMatch = odds && Number(odds.no_match)
-      ? `<p class="muted">No matching betting event was found for this match${manual ? ' — showing the odds set by the admin.' : ' — odds unavailable.'}</p>`
+      ? '<p class="muted">No matching betting event was found for this match — odds unavailable.</p>'
       : '';
 
-    const adminForm = user && user.is_admin ? `
-      <details class="manual-odds" ${!fetched && !manual ? 'open' : ''}>
-        <summary class="muted small">Set odds manually (admin)</summary>
-        <div class="manual-odds-form">
-          <input id="mnHome" type="number" step="0.01" min="1.01" placeholder="1 (home)" value="${odds?.manual_home ?? ''}"/>
-          <input id="mnDraw" type="number" step="0.01" min="1.01" placeholder="X (draw)" value="${odds?.manual_draw ?? ''}"/>
-          <input id="mnAway" type="number" step="0.01" min="1.01" placeholder="2 (away)" value="${odds?.manual_away ?? ''}"/>
-          <button id="mnSave" class="primary">Save</button>
-          ${manual ? '<button id="mnClear">Clear</button>' : ''}
-        </div>
-        <p class="muted small">Decimal odds (e.g. 2.10), shown to everyone. Leave draw empty for knockout matches;
-        use this when the odds service can't find the match. Refreshes never overwrite manual odds.</p>
+    const adminPicker = user && user.is_admin ? `
+      <details class="link-odds" ${odds && Number(odds.no_match) ? 'open' : ''}>
+        <summary class="muted small">Link the betting event by hand (admin)</summary>
+        <p class="muted small">When "Refresh odds" can't find this match (the two data providers sometimes
+        name teams differently), list what the odds service is running and pick the right event —
+        its odds are used from then on, including future refreshes.</p>
+        <button id="oddsSearch">List candidate events</button>
+        <div id="oddsCandidates"></div>
       </details>` : '';
 
     body.innerHTML = `${table}${noMatch}${info}
       <button id="oddsRefresh">Refresh odds</button>
       <span class="muted small" id="oddsCountdown"></span>
-      ${adminForm}`;
+      ${adminPicker}`;
 
     const btn = document.getElementById('oddsRefresh');
     const cd = document.getElementById('oddsCountdown');
@@ -563,22 +553,51 @@
       }
     };
 
-    const saveManual = async (values) => {
+    const searchBtn = document.getElementById('oddsSearch');
+    if (searchBtn) searchBtn.onclick = async () => {
+      const box = document.getElementById('oddsCandidates');
+      searchBtn.disabled = true;
+      searchBtn.textContent = 'Searching…';
       try {
-        const r = await api('admin_odds', { match_id: Number(matchId), ...values });
-        toast(values.home == null && values.draw == null && values.away == null
-          ? 'Manual odds cleared.' : 'Manual odds saved.', true);
-        renderOdds(matchId, r.odds, r.odds_refresh_in, Math.floor(Date.now() / 1000));
-      } catch (err) { toast(err.message); }
+        const { candidates } = await api('admin_odds_search', { match_id: Number(matchId) });
+        searchBtn.textContent = 'List candidate events';
+        searchBtn.disabled = false;
+        if (!candidates.length) {
+          box.innerHTML = '<p class="muted small">The odds service returned no events for either team or this tournament.</p>';
+          return;
+        }
+        box.innerHTML = `
+          <table>
+            <tr><th>Event</th><th>Kickoff</th><th>League</th><th></th></tr>
+            ${candidates.map((c) => `
+              <tr>
+                <td>${esc(c.home || '?')} – ${esc(c.away || '?')}</td>
+                <td class="muted small">${c.date ? fmtDate(c.date) : '?'}</td>
+                <td class="muted small">${esc(c.league || '')}</td>
+                <td><button class="odds-use" data-event="${esc(String(c.event_id))}">Use</button></td>
+              </tr>`).join('')}
+          </table>`;
+        box.querySelectorAll('.odds-use').forEach((b) => {
+          b.onclick = async () => {
+            b.disabled = true;
+            b.textContent = 'Linking…';
+            try {
+              const r = await api('admin_odds_link', { match_id: Number(matchId), event_id: b.dataset.event });
+              toast('Event linked — odds fetched.', true);
+              renderOdds(matchId, r.odds, r.odds_refresh_in, Math.floor(Date.now() / 1000));
+            } catch (err) {
+              toast(err.message);
+              b.disabled = false;
+              b.textContent = 'Use';
+            }
+          };
+        });
+      } catch (err) {
+        toast(err.message);
+        searchBtn.disabled = false;
+        searchBtn.textContent = 'List candidate events';
+      }
     };
-    const mnSave = document.getElementById('mnSave');
-    if (mnSave) mnSave.onclick = () => saveManual({
-      home: document.getElementById('mnHome').value || null,
-      draw: document.getElementById('mnDraw').value || null,
-      away: document.getElementById('mnAway').value || null,
-    });
-    const mnClear = document.getElementById('mnClear');
-    if (mnClear) mnClear.onclick = () => saveManual({ home: null, draw: null, away: null });
   }
 
   // ---- admin views -----------------------------------------------------------

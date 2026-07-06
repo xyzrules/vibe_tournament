@@ -22,8 +22,8 @@
  * ADMIN: a user `admin` (password `admin`) is created automatically and
  * gets the Admin page on the site: show/hide tournaments and matches, set
  * the guess mode per tournament (1x2 / win-loss / handicap), points per
- * match and per round, force an immediate fixtures/results sync, and set
- * match odds manually when the odds service can't find the event.
+ * match and per round, force an immediate fixtures/results sync, and link
+ * the betting event by hand when the odds service can't find the match.
  * CHANGE THE ADMIN PASSWORD after first login by editing the Users tab
  * (or just keep the sheet private and trust friends).
  */
@@ -52,8 +52,7 @@ var TABS = {
             'round_id', 'pen_home', 'pen_away', 'adv_winner', 'aet', 'hidden', 'hdp'],
   Predictions: ['username', 'match_id', 'pick', 'updated_at', 'hdp', 'mode'],
   Odds: ['match_id', 'event_id', 'fetched_at', 'fetched_by', 'no_match',
-         'dk_home', 'dk_draw', 'dk_away', 'xb_home', 'xb_draw', 'xb_away',
-         'manual_home', 'manual_draw', 'manual_away', 'manual_by', 'manual_at'],
+         'dk_home', 'dk_draw', 'dk_away', 'xb_home', 'xb_draw', 'xb_away'],
   Meta: ['key', 'value'],
 };
 
@@ -173,7 +172,8 @@ function doPost(e) {
     history: apiHistory_, match: apiMatchDetail_, predict: apiPredict_,
     odds_refresh: apiOddsRefresh_,
     admin_overview: apiAdminOverview_, admin_tournament: apiAdminTournament_,
-    admin_match: apiAdminMatch_, admin_sync: apiAdminSync_, admin_odds: apiAdminOdds_,
+    admin_match: apiAdminMatch_, admin_sync: apiAdminSync_,
+    admin_odds_search: apiAdminOddsSearch_, admin_odds_link: apiAdminOddsLink_,
     admin_usage: apiAdminUsage_,
   };
   var handler = actions[body.action];
@@ -187,7 +187,7 @@ function doPost(e) {
       : /locked/.test(msg) ? 403
       : /not found/.test(msg) ? 404
       : /taken/.test(msg) ? 409
-      : /username|password|pick|JSON|line|mode|points|odds/.test(msg) ? 400 : 500;
+      : /username|password|pick|JSON|line|mode|points|event/.test(msg) ? 400 : 500;
     return json_({ error: msg, code: code });
   }
 }
@@ -730,41 +730,90 @@ function apiAdminSync_(body) {
   return { ok: true, last_synced: now, match: match };
 }
 
-// Admin manual odds: fallback for when the odds service has no matching
-// event (footballdata ↔ odds-api naming differences). Stored next to the
-// fetched odds and preserved across refreshes; sending all-empty clears them.
-function apiAdminOdds_(body) {
+// Admin event picker: when "Refresh odds" can't match a betting event
+// (footballdata ↔ odds-api naming differences), the admin browses what the
+// odds service is actually running — events matching either team name, plus
+// the whole odds-api league when its name matches the tournament — and picks
+// the right event to link to the match.
+function apiAdminOddsSearch_(body) {
+  requireAdmin_(body);
+  var m = readTab_('Matches').filter(function (r) { return Number(r.match_id) === Number(body.match_id); })[0];
+  if (!m) throw new Error('not found');
+  var t = getTournament_(m.league_id);
+
+  var seen = {};
+  var events = [];
+  var errors = [];
+  var collect = function (list) {
+    (list || []).forEach(function (ev) {
+      if (!ev || ev.id == null || seen[ev.id]) return;
+      seen[ev.id] = 1;
+      events.push(ev);
+    });
+  };
+  [m.home_team, m.away_team].forEach(function (q) {
+    try {
+      collect(oaSearchEvents_(q));
+    } catch (err) {
+      errors.push(String(err && err.message || err));
+    }
+  });
+  try {
+    var slug = t ? oaFindLeagueSlug_(t.name, t.country) : null;
+    if (slug) collect(oaLeagueEvents_(slug));
+  } catch (err) {
+    errors.push(String(err && err.message || err));
+  }
+  if (!events.length && errors.length) throw new Error(errors[0]);
+
+  var kickoff = Number(m.kickoff_unix);
+  var candidates = events.map(function (ev) {
+    var ts = Math.floor(new Date(ev.date).getTime() / 1000);
+    return {
+      event_id: ev.id,
+      home: ev.home || null,
+      away: ev.away || null,
+      date: isFinite(ts) ? ts : null,
+      league: ev.league && ev.league.name ? ev.league.name : (typeof ev.league === 'string' ? ev.league : null),
+    };
+  });
+  candidates.sort(function (a, b) {
+    var da = a.date == null ? Infinity : Math.abs(a.date - kickoff);
+    var db = b.date == null ? Infinity : Math.abs(b.date - kickoff);
+    return da - db;
+  });
+  return {
+    candidates: candidates.slice(0, 30),
+    match: { match_id: Number(m.match_id), home_team: m.home_team, away_team: m.away_team, kickoff_unix: kickoff },
+  };
+}
+
+// Links a hand-picked odds-api event to the match and fetches its odds right
+// away. The stored event_id makes every future "Refresh odds" use it too.
+function apiAdminOddsLink_(body) {
   var username = requireAdmin_(body);
   var matchId = Number(body.match_id);
   var m = readTab_('Matches').filter(function (r) { return Number(r.match_id) === matchId; })[0];
   if (!m) throw new Error('not found');
-  var vals = {};
-  ['home', 'draw', 'away'].forEach(function (k) {
-    var v = body[k];
-    if (v == null || v === '') { vals[k] = null; return; }
-    var n = Number(v);
-    if (!isFinite(n) || n <= 1) throw new Error('bad odds: use decimal odds greater than 1 (e.g. 2.10)');
-    vals[k] = n;
-  });
-  var clearing = vals.home == null && vals.draw == null && vals.away == null;
+  if (body.event_id == null || body.event_id === '') throw new Error('missing event id');
+  var payload = oaOdds_(body.event_id);
+  var dk = extractMl_(payload, 'DraftKings');
+  var xb = extractMl_(payload, '1xbet');
   var lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
     var existing = readTab_('Odds').filter(function (r) { return Number(r.match_id) === matchId; })[0];
-    var row = existing || { match_id: matchId };
-    row.manual_home = vals.home;
-    row.manual_draw = vals.draw;
-    row.manual_away = vals.away;
-    row.manual_by = clearing ? null : username;
-    row.manual_at = clearing ? null : now_();
+    var row = {
+      match_id: matchId, event_id: body.event_id, fetched_at: now_(), fetched_by: username, no_match: 0,
+      dk_home: dk && dk.home, dk_draw: dk && dk.draw, dk_away: dk && dk.away,
+      xb_home: xb && xb.home, xb_draw: xb && xb.draw, xb_away: xb && xb.away,
+    };
     if (existing) updateRow_('Odds', existing._row, row);
     else appendRow_('Odds', row);
   } finally {
     lock.releaseLock();
   }
-  var now = now_();
-  var odds = getOddsRow_(matchId);
-  return { ok: true, odds: odds, odds_refresh_in: oddsRefreshIn_(odds, now) };
+  return { ok: true, odds: getOddsRow_(matchId), odds_refresh_in: ODDS_LOCK_SECONDS };
 }
 
 // ---------------------------------------------------------------------------
@@ -799,15 +848,7 @@ function apiOddsRefresh_(body) {
       return { status: 'locked', odds: existing, odds_refresh_in: oddsRefreshIn_(existing, now) };
     }
 
-    // Admin-entered manual odds live in the same row — never clobbered by a refresh.
-    var manual = {};
-    if (existing) {
-      ['manual_home', 'manual_draw', 'manual_away', 'manual_by', 'manual_at'].forEach(function (f) {
-        manual[f] = existing[f];
-      });
-    }
     var saveRow = function (obj) {
-      Object.keys(manual).forEach(function (f) { obj[f] = manual[f]; });
       if (existingRow) updateRow_('Odds', existingRow._row, obj);
       else appendRow_('Odds', obj);
     };
@@ -980,6 +1021,25 @@ function oaSearchEvents_(query) {
 
 function oaOdds_(eventId) {
   return oaGet_('/odds', { eventId: eventId, bookmakers: 'DraftKings,1xbet' });
+}
+
+// odds-api league slug for a tournament, e.g. "England - Premier League" →
+// england-premier-league. Matched on country + name tokens; null when the
+// name is ambiguous (several countries run a "Premier League").
+function oaFindLeagueSlug_(tournamentName, country) {
+  var body = oaGet_('/leagues', { sport: 'football' });
+  var leagues = Object.prototype.toString.call(body) === '[object Array]' ? body : (body && body.data) || [];
+  var wanted = (country ? country + ' ' : '') + String(tournamentName || '');
+  var hits = leagues.filter(function (lg) {
+    return lg && lg.slug && teamsMatch_(wanted, lg.name);
+  });
+  return hits.length === 1 ? hits[0].slug : null;
+}
+
+function oaLeagueEvents_(slug) {
+  var body = oaGet_('/events', { sport: 'football', league: slug });
+  if (Object.prototype.toString.call(body) === '[object Array]') return body;
+  return (body && body.data) || [];
 }
 
 // ---------------------------------------------------------------------------

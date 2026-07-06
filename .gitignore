@@ -2,3 +2,4 @@ node_modules/
 .env
 data/
 source.txt
+.DS_Store
