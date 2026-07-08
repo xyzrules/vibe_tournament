@@ -21,9 +21,11 @@
  *
  * ADMIN: a user `admin` (password `admin`) is created automatically and
  * gets the Admin page on the site: show/hide tournaments and matches, set
- * the guess mode per tournament (1x2 / win-loss / handicap), points per
- * match and per round, force an immediate fixtures/results sync, and link
- * the betting event by hand when the odds service can't find the match.
+ * the guess mode per tournament (1x2 / win-loss / handicap — in 1x2
+ * tournaments knockout rounds automatically switch to win/loss, since
+ * someone always advances), points per match and per round, force an
+ * immediate fixtures/results sync, and link the betting event by hand when
+ * the odds service can't find the match.
  * CHANGE THE ADMIN PASSWORD after first login by editing the Users tab
  * (or just keep the sheet private and trust friends).
  */
@@ -355,17 +357,36 @@ function advWinnerOf_(m) {
   return null;
 }
 
+// Mode that applies to one match when picking. Knockout matches can't end in
+// a draw — someone always advances — so 1x2 tournaments (e.g. the World Cup)
+// use 1x2 for the group stage and win/loss for the elimination rounds.
+function effectiveMode_(t, isGroup) {
+  var mode = tournamentMode_(t);
+  if (mode === '1x2' && !isGroup) return 'wl';
+  return mode;
+}
+
+// Mode a pick is scored under: the mode stored with the pick (the admin
+// changing the tournament mode never re-scores old picks), except that
+// knockout matches are always settled win/loss — a regulation draw there is
+// decided by extra time / penalties, never left as "draw".
+function scoringMode_(m, t, pred) {
+  var stored = pred && GUESS_MODES.indexOf(pred.mode) >= 0 ? pred.mode : null;
+  var mode = stored || tournamentMode_(t);
+  if (mode === 'handicap') return 'handicap';
+  return m.is_group ? mode : 'wl';
+}
+
 /**
- * Scores one prediction. Returns:
+ * Scores one prediction. Requires m to be decorated (is_group set). Returns:
  *   {outcome: 'correct'|'wrong'|'push'|'void'|null, points: number|null}
  * null outcome = not settled yet. 'push' (handicap landed exactly on the
- * line) and 'void' (win/loss pick but no winner is determinable) award 0
+ * line) and 'void' (no winner is determinable for a win/loss pick, or the
+ * pick was made under rules where the outcome can't be judged) award 0
  * and don't count against accuracy.
  */
 function scorePrediction_(m, t, pred) {
-  // Each pick is scored under the guess mode that was active when it was
-  // made — the admin changing the tournament mode never re-scores old picks.
-  var mode = pred && GUESS_MODES.indexOf(pred.mode) >= 0 ? pred.mode : tournamentMode_(t);
+  var mode = scoringMode_(m, t, pred);
   var pts = matchPoints_(m, t);
   if (m.status !== 'complete' || m.home_score == null || m.away_score == null) {
     return { outcome: null, points: null };
@@ -379,16 +400,26 @@ function scorePrediction_(m, t, pred) {
     return pred.pick === winner ? { outcome: 'correct', points: pts } : { outcome: 'wrong', points: 0 };
   }
   if (mode === 'wl') {
+    // A draw pick predates the win/loss rules for this match — void it
+    // rather than judging it under rules that changed after the pick.
+    if (pred.pick === 'draw') return { outcome: 'void', points: 0 };
+    if (m.is_group) {
+      // Group matches have no advancing team; the FT result settles the
+      // pick, and a draw voids it (draw was not a pickable answer).
+      var ft = winnerOf_(m);
+      if (ft === 'draw') return { outcome: 'void', points: 0 };
+      return pred.pick === ft ? { outcome: 'correct', points: pts } : { outcome: 'wrong', points: 0 };
+    }
     var adv = advWinnerOf_(m);
     if (!adv) {
-      // FT draw: knockout matches wait for the penalties lookup; if we've
-      // already checked and there was no decider, the pick is void.
+      // FT draw: wait for the penalties/extra-time lookup. 'none' means the
+      // last lookup found no decider — shown as void, retried next tick.
       if (m.adv_winner === 'none') return { outcome: 'void', points: 0 };
       return { outcome: null, points: null };
     }
     return pred.pick === adv ? { outcome: 'correct', points: pts } : { outcome: 'wrong', points: 0 };
   }
-  // 1x2: regulation result, draws are a valid pick
+  // 1x2 (group/league matches): regulation result, draws are a valid pick
   var result = winnerOf_(m);
   return pred.pick === result ? { outcome: 'correct', points: pts } : { outcome: 'wrong', points: 0 };
 }
@@ -440,6 +471,7 @@ function decorateMatch_(m, t, roundMap) {
   var r = roundMap[String(m.round_id)];
   m.round_name = r ? r.name : null;
   m.is_group = r ? r.is_group : true;
+  m.mode = effectiveMode_(t, m.is_group);
   m.points = matchPoints_(m, t);
   m.result = winnerOf_(m);
   m.adv = advWinnerOf_(m);
@@ -526,10 +558,13 @@ function apiMatchDetail_(body) {
 function apiPredict_(body) {
   var username = requireUser_(body);
   var pick = body.pick;
-  var m = readTab_('Matches').filter(function (r) { return Number(r.match_id) === Number(body.match_id); })[0];
+  var allMatches = readTab_('Matches');
+  var m = allMatches.filter(function (r) { return Number(r.match_id) === Number(body.match_id); })[0];
   if (!m || (!isAdmin_(username) && Number(m.hidden))) throw new Error('not found');
   var t = getTournament_(m.league_id) || {};
-  var mode = tournamentMode_(t);
+  var leagueAll = allMatches.filter(function (r) { return Number(r.league_id) === Number(m.league_id); });
+  var round = roundsByIdMap_(roundsInfo_(leagueAll))[String(m.round_id)];
+  var mode = effectiveMode_(t, round ? round.is_group : true);
   var allowed = mode === '1x2' ? ['home', 'draw', 'away'] : ['home', 'away'];
   if (allowed.indexOf(pick) < 0) throw new Error('bad pick');
   if (mode === 'handicap' && (m.hdp == null || m.hdp === '' || !isFinite(Number(m.hdp)))) {
@@ -1023,6 +1058,14 @@ function oaOdds_(eventId) {
   return oaGet_('/odds', { eventId: eventId, bookmakers: 'DraftKings,1xbet' });
 }
 
+// Single event by id (used to read period scores off the linked event).
+function oaEvent_(eventId) {
+  var body = oaGet_('/events/' + encodeURIComponent(eventId), {});
+  var ev = body && body.data != null ? body.data : body;
+  if (Object.prototype.toString.call(ev) === '[object Array]') ev = ev[0];
+  return ev && ev.id != null ? ev : null;
+}
+
 // odds-api league slug for a tournament, e.g. "England - Premier League" →
 // england-premier-league. Matched on country + name tokens; null when the
 // name is ambiguous (several countries run a "Premier League").
@@ -1164,37 +1207,63 @@ function syncAll_(now) {
 
 // ---------------------------------------------------------------------------
 // Penalty / extra-time enrichment: footballdata has no shootout data, but
-// odds-api events carry period scores (ft / ot / ap) and the winner-inclusive
-// final score. For knockout matches that finished level in regulation we look
-// the event up once and store who actually advanced.
+// odds-api events carry period scores (ft / ot / ap = penalty shootout) and
+// a final score. For knockout matches that finished level in regulation we
+// look the event up and store who actually advanced — the shootout tally
+// decides when there was one. Lookups retry each tick until a winner is known.
 // ---------------------------------------------------------------------------
 
-// True for knockout matches that finished level in regulation and haven't
-// had their advancing-team lookup yet (adv_winner is home/away/none once done).
+// True for knockout matches that finished level in regulation and whose
+// advancing team is still unknown. adv_winner = 'none' means the last lookup
+// found no decider (e.g. the betting site hadn't posted the shootout yet) —
+// those are retried until a winner appears.
 function needsEnrich_(m, roundMap) {
   var r = roundMap[String(m.round_id)];
   if (!r || r.is_group) return false;
   if (m.status !== 'complete' || m.home_score == null) return false;
   if (Number(m.home_score) !== Number(m.away_score)) return false; // decided in regulation
-  return !m.adv_winner;
+  return !m.adv_winner || m.adv_winner === 'none';
 }
 
-// One odds-api lookup: stores who advanced + penalties / AET on the match row.
-function enrichMatch_(m) {
-  var events = oaSearchEvents_(m.home_team);
-  var ev = findEvent_(m, events);
-  var update = { adv_winner: 'none', aet: 0, pen_home: null, pen_away: null };
-  if (ev && ev.scores) {
-    var sc = ev.scores;
-    if (Number(sc.home) > Number(sc.away)) update.adv_winner = 'home';
-    else if (Number(sc.home) < Number(sc.away)) update.adv_winner = 'away';
-    var periods = sc.periods || {};
-    if (periods.ap) {
-      update.pen_home = Number(periods.ap.home);
-      update.pen_away = Number(periods.ap.away);
-    }
-    if (periods.ot) update.aet = 1;
+// Pure decision: given an odds-api event `scores` object, who advanced?
+// Penalties decide the winner whenever a shootout happened; otherwise the
+// event's final (extra-time-inclusive) score does. 'none' = still level.
+function advFromScores_(sc) {
+  var periods = (sc && sc.periods) || {};
+  var out = { adv_winner: 'none', aet: 0, pen_home: null, pen_away: null };
+  if (periods.ot) out.aet = 1;
+  if (periods.ap && periods.ap.home != null && periods.ap.away != null) {
+    out.pen_home = Number(periods.ap.home);
+    out.pen_away = Number(periods.ap.away);
   }
+  if (out.pen_home != null && out.pen_home !== out.pen_away) {
+    out.adv_winner = out.pen_home > out.pen_away ? 'home' : 'away';
+  } else if (Number(sc.home) > Number(sc.away)) {
+    out.adv_winner = 'home';
+  } else if (Number(sc.home) < Number(sc.away)) {
+    out.adv_winner = 'away';
+  }
+  return out;
+}
+
+// One odds-api lookup: stores who advanced + penalties / AET on the match
+// row, combining footballdata's result with the betting site's period scores.
+// Prefers the betting event already linked to the match (by "Refresh odds" or
+// by the admin's hand-pick), falling back to a name search.
+function enrichMatch_(m) {
+  var ev = null;
+  var oddsRow = getOddsRow_(m.match_id);
+  if (oddsRow && oddsRow.event_id) {
+    try { ev = oaEvent_(oddsRow.event_id); } catch (err) { ev = null; }
+  }
+  if (!ev) {
+    var events = oaSearchEvents_(m.home_team);
+    ev = findEvent_(m, events);
+  }
+  // No event or no scores yet: leave adv_winner unset so the next tick retries.
+  if (!ev || !ev.scores) return;
+
+  var update = advFromScores_(ev.scores);
   m.adv_winner = update.adv_winner;
   m.aet = update.aet;
   m.pen_home = update.pen_home;

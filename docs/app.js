@@ -8,7 +8,7 @@
   let countdownTimer = null;
 
   const MODE_LABEL = {
-    '1x2': 'Win / Draw / Loss',
+    '1x2': 'Win / Draw / Loss (knockout: Win / Loss)',
     wl: 'Win / Loss (who advances)',
     handicap: 'Goal handicap',
   };
@@ -419,7 +419,8 @@
     busy('Loading match…');
     const data = await api('match', { match_id: Number(matchId) });
     const m = data.match;
-    const mode = data.tournament.guess_mode;
+    // knockout matches in 1x2 tournaments are picked win/loss (who advances)
+    const mode = m.mode || data.tournament.guess_mode;
     const finished = m.status === 'complete';
 
     const picksList = m.picks
@@ -636,8 +637,8 @@
             <label><input type="checkbox" class="adm-visible" ${Number(t.visible) ? 'checked' : ''}/> visible to players</label>
             <label>Guess mode:
               <select class="adm-mode">
-                <option value="1x2" ${t.guess_mode === '1x2' ? 'selected' : ''}>Win / Draw / Loss</option>
-                <option value="wl" ${t.guess_mode === 'wl' ? 'selected' : ''}>Win / Loss (who advances)</option>
+                <option value="1x2" ${t.guess_mode === '1x2' ? 'selected' : ''}>Win / Draw / Loss (knockout rounds auto Win / Loss)</option>
+                <option value="wl" ${t.guess_mode === 'wl' ? 'selected' : ''}>Win / Loss everywhere (who advances)</option>
                 <option value="handicap" ${t.guess_mode === 'handicap' ? 'selected' : ''}>Goal handicap</option>
               </select>
             </label>
